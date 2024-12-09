@@ -1,0 +1,192 @@
+// Package bip39 is the Golang implementation of the BIP39 spec.
+//
+// The official BIP39 spec can be found at
+// https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+// https://github.com/tyler-smith/go-bip39
+package bip39
+
+import (
+	"bip39/wordlists"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
+	"errors"
+	"fmt"
+	"math/big"
+	"strings"
+
+	"golang.org/x/crypto/pbkdf2"
+)
+
+var (
+	wordList = wordlists.English
+	wordMap  = map[string]int{}
+	masksMap = map[int]*big.Int{
+		12: big.NewInt(15),
+		15: big.NewInt(31),
+		18: big.NewInt(63),
+		21: big.NewInt(127),
+		24: big.NewInt(255),
+	}
+	shiftMap = map[int]*big.Int{
+		12: big.NewInt(16),
+		15: big.NewInt(8),
+		18: big.NewInt(4),
+		21: big.NewInt(2),
+	}
+	errEntropyLengthInvalid = errors.New("entropy length must be [128, 256] and a multiple of 32")
+	errNotFoundSeed         = errors.New("word `%v` not found in reverse map")
+	errChecksumIncorrect    = errors.New("checksum incorrect")
+	errInvalidMnemonic      = errors.New("invalid mnenomic")
+)
+
+func init() {
+	for i, v := range wordList {
+		wordMap[v] = i
+	}
+}
+
+func NewEntropy(size int) ([]byte, error) {
+	// Checking if the size of the entropy is valid
+	if size%32 != 0 || size < 128 || size > 256 {
+		return nil, errEntropyLengthInvalid
+	}
+	// Creating a byte slice to store the entropy
+	entropy := make([]byte, size/8)
+	// Filling the entropy slice with random bytes
+	_, _ = rand.Read(entropy)
+	// Returning the entropy slice and no error
+	return entropy, nil
+}
+
+func NewMnemonic(entropy []byte) (string, error) {
+	// Calculating the entropy size in bits
+	size := len(entropy) * 8
+	// Checking the validity of the entropy length
+	if size%32 != 0 || size < 128 || size > 256 {
+		return "", errEntropyLengthInvalid
+	}
+	// Converting the entropy into a big integer
+	intropy := new(big.Int).SetBytes(addChecksum(entropy))
+	// Initializing a slice to store the mnemonic words
+	WORD := make([]string, (33*size)/352)
+	// Filling the slice with mnemonic words
+	for i := len(WORD) - 1; i >= 0; i-- {
+		WORD[i] = wordList[intropy.Uint64()%2048]
+		intropy.Rsh(intropy, 11)
+	}
+	// Joining the mnemonic words into a single string
+	return strings.Join(WORD, " "), nil
+}
+
+func Mnemonic2Entropy(mnemonic string) ([]byte, error) {
+	// Splitting the mnemonic into a slice of words and validating its length
+	wordSlice, ok := split(mnemonic)
+	if !ok {
+		return nil, errInvalidMnemonic
+	}
+	// Initializing a big integer to store the entropy
+	var b big.Int
+	// Constructing the big integer from the mnemonic words
+	for _, v := range wordSlice {
+		idx, found := wordMap[v]
+		if !found {
+			return nil, fmt.Errorf(errNotFoundSeed.Error(), v)
+		}
+		b.Lsh(&b, 11).Or(&b, big.NewInt(int64(idx)))
+	}
+	// Extracting the checksum from the constructed big integer
+	checksum := new(big.Int).And(&b, masksMap[len(wordSlice)])
+	// Right shifting the big integer to remove the checksum
+	b.Rsh(&b, uint(len(wordSlice)/3))
+	// Converting the big integer into a byte slice and padding it if necessary
+	entropy := padding(b.Bytes(), len(wordSlice)/3*4)
+	// Calculating the checksum of the entropy
+	sha := sha256.New()
+	sha.Write(entropy)
+	entropyChecksum := big.NewInt(int64(sha.Sum(nil)[0]))
+	// Adjusting the checksum if the mnemonic length is not 24 words
+	if i := len(wordSlice); i != 24 {
+		entropyChecksum.Div(entropyChecksum, shiftMap[i])
+	}
+	// Checking if the calculated checksum matches the extracted checksum
+	if checksum.Cmp(entropyChecksum) != 0 {
+		return nil, errChecksumIncorrect
+	}
+	// Returning the entropy byte slice
+	return entropy, nil
+}
+
+func Mnemonic2ByteArray(mnemonic string, raw ...bool) ([]byte, error) {
+	// Calculate the length of the mnemonic in words
+	length := len(strings.Fields(mnemonic))
+	// Calculate the size of the byte array needed
+	byteSize := (length*11 + 7) >> 3
+	// Convert the mnemonic to raw entropy
+	rawEntropy, err := Mnemonic2Entropy(mnemonic)
+	if err != nil {
+		return nil, err
+	}
+	// If raw entropy is requested, return it
+	if raw != nil && raw[0] {
+		return rawEntropy, nil
+	}
+	// Add checksum and pad the entropy before returning
+	return padding(addChecksum(rawEntropy), byteSize), nil
+}
+
+func NewSeedWithCheck(mnemonic string, password string) ([]byte, error) {
+	// Convert mnemonic to byte array with checksum validation
+	if _, err := Mnemonic2ByteArray(mnemonic); err != nil {
+		return nil, err
+	}
+	// Generate seed using mnemonic and password
+	return pbkdf2.Key([]byte(mnemonic), []byte("mnemonic"+password), 2048, 64, sha512.New), nil
+}
+
+func IsMnemonicValid(mnemonic string) bool {
+	_, err := Mnemonic2Entropy(mnemonic)
+	return err == nil
+}
+
+func addChecksum(entropy []byte) []byte {
+	// Calculate the first checksum of the entropy
+	sha := sha256.New()
+	sha.Write(entropy)
+	firstChecksum := sha.Sum(nil)[0]
+	// Convert the entropy into a big integer
+	intropy := new(big.Int).SetBytes(entropy)
+	// Iterate over each 4 bytes of the entropy
+	for i := 0; i < len(entropy)>>2; i++ {
+		// Multiply the big integer by 2
+		intropy.Mul(intropy, big.NewInt(2))
+		// If the corresponding bit of the first checksum is 1,
+		// set the least significant bit of the big integer to 1
+		if firstChecksum>>(7-i)&1 == 1 {
+			intropy.Or(intropy, big.NewInt(1))
+		}
+	}
+	// Convert the big integer back to a byte slice and return it
+	return intropy.Bytes()
+}
+
+func padding(slice []byte, length int) []byte {
+	// If the length of the slice is already at least as long as desired,
+	// return the slice as is.
+	if len(slice) >= length {
+		return slice
+	}
+	// Create a new byte slice filled with zeros to reach the desired length,
+	// then append it to the original slice.
+	return append(make([]byte, length-len(slice)), slice...)
+}
+
+func split(mnemonic string) ([]string, bool) {
+	// Split the mnemonic into words.
+	wordSlice := strings.Fields(mnemonic)
+	// Check if the number of words is between 12 and 24 inclusively and divisible by 3.
+	if length := len(wordSlice); length >= 12 && length <= 24 && length%3 == 0 {
+		return wordSlice, true // Return the words if the conditions are met.
+	}
+	return nil, false // Otherwise, return nil and false.
+}
